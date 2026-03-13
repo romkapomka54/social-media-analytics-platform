@@ -1,6 +1,5 @@
-"""
-Approval Workflow router for managing draft responses.
-"""
+""" Approval Workflow router for managing draft responses. """
+import asyncio
 from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict
 from datetime import datetime
@@ -13,35 +12,27 @@ from ..models.schemas import (
     DraftPublish
 )
 from ..core.config import settings
+from ..services.telegram_notifier import get_telegram_notifier
 
 router = APIRouter(prefix="/approval", tags=["approval"])
 
 
 @router.get("/drafts/{tenant_id}", response_model=List[DraftResponse])
 async def get_drafts(tenant_id: str, status: str = "pending"):
-    """
-    Get all drafts for a tenant, optionally filtered by status.
-    """
+    """ Get all drafts for a tenant, optionally filtered by status. """
     supabase = settings.supabase_client
-    
-    query = supabase.table("draft_responses")\
-        .select("*")\
-        .eq("tenant_id", tenant_id)
-    
+    query = supabase.table("draft_responses").select("*").eq("tenant_id", tenant_id)
     if status:
         query = query.eq("status", status)
-    
     result = query.order("created_at", desc=True).execute()
     return result.data
 
 
 @router.post("/drafts", response_model=DraftResponse)
 async def create_draft(draft: DraftCreate):
-    """
-    Create a new draft response.
-    """
+    """ Create a new draft response and send Telegram notification. """
     supabase = settings.supabase_client
-    
+
     # Insert draft
     result = supabase.table("draft_responses").insert({
         "tenant_id": draft.tenant_id,
@@ -55,138 +46,149 @@ async def create_draft(draft: DraftCreate):
         "original_nps_category": draft.nps_category,
         "status": "pending"
     }).execute()
-    
+
+    draft_data = result.data[0]
+
     # Log creation
     supabase.table("approval_workflow_logs").insert({
-        "draft_id": result.data[0]["id"],
+        "draft_id": draft_data["id"],
         "action": "created",
         "notes": "AI generated draft"
     }).execute()
-    
-    return result.data[0]
+
+    # Send Telegram notification if configured
+    telegram_notifier = get_telegram_notifier()
+    if telegram_notifier:
+        asyncio.create_task(
+            telegram_notifier.send_draft_notification(
+                draft_id=draft_data["id"],
+                tenant_id=draft.tenant_id,
+                comment_text=draft.comment_text,
+                platform=draft.platform,
+                nps_category=draft.nps_category or "neutral",
+                suggested_reply=draft.ai_generated_reply
+            )
+        )
+
+    return draft_data
 
 
 @router.post("/drafts/approve")
 async def approve_draft(request: DraftApprove):
-    """
-    Approve a draft response.
-    """
+    """ Approve a draft response. """
     supabase = settings.supabase_client
-    
+
     # Update status
-    result = supabase.table("draft_responses")\
-        .update({
-            "status": "approved",
-            "reviewed_at": datetime.now().isoformat()
-        })\
-        .eq("id", request.draft_id)\
-        .execute()
-    
+    result = supabase.table("draft_responses").update({
+        "status": "approved",
+        "reviewed_at": datetime.now().isoformat()
+    }).eq("id", request.draft_id).execute()
+
     if not result.data:
         raise HTTPException(status_code=404, detail="Draft not found")
-    
+
     # Log approval
     supabase.table("approval_workflow_logs").insert({
         "draft_id": request.draft_id,
         "action": "approved",
         "notes": request.notes
     }).execute()
-    
+
+    # Update Telegram notification
+    telegram_notifier = get_telegram_notifier()
+    if telegram_notifier:
+        asyncio.create_task(
+            telegram_notifier.update_draft_status(
+                request.draft_id, "approved"
+            )
+        )
+
     return {"status": "approved", "draft_id": request.draft_id}
 
 
 @router.post("/drafts/reject")
 async def reject_draft(request: DraftReject):
-    """
-    Reject a draft response.
-    """
+    """ Reject a draft response. """
     supabase = settings.supabase_client
-    
+
     # Update status
-    result = supabase.table("draft_responses")\
-        .update({
-            "status": "rejected",
-            "reviewed_at": datetime.now().isoformat()
-        })\
-        .eq("id", request.draft_id)\
-        .execute()
-    
+    result = supabase.table("draft_responses").update({
+        "status": "rejected",
+        "reviewed_at": datetime.now().isoformat()
+    }).eq("id", request.draft_id).execute()
+
     if not result.data:
         raise HTTPException(status_code=404, detail="Draft not found")
-    
+
     # Log rejection
     supabase.table("approval_workflow_logs").insert({
         "draft_id": request.draft_id,
         "action": "rejected",
         "notes": request.reason
     }).execute()
-    
+
+    # Update Telegram notification
+    telegram_notifier = get_telegram_notifier()
+    if telegram_notifier:
+        asyncio.create_task(
+            telegram_notifier.update_draft_status(
+                request.draft_id, "rejected"
+            )
+        )
+
     return {"status": "rejected", "draft_id": request.draft_id}
 
 
 @router.post("/drafts/{draft_id}/publish")
 async def publish_draft(draft_id: str):
-    """
-    Publish an approved draft to social media.
-    TODO: Integrate with actual social media API (Instagram, YouTube, etc.)
-    """
+    """ Publish an approved draft to social media. """
     supabase = settings.supabase_client
-    
+
     # Check if draft is approved
-    draft_check = supabase.table("draft_responses")\
-        .select("status")\
-        .eq("id", draft_id)\
-        .execute()
-    
+    draft_check = supabase.table("draft_responses").select("status").eq("id", draft_id).execute()
     if not draft_check.data:
         raise HTTPException(status_code=404, detail="Draft not found")
-    
     if draft_check.data[0]["status"] != "approved":
         raise HTTPException(status_code=400, detail="Only approved drafts can be published")
-    
+
     # TODO: Call actual social media API to publish the reply
     # For now, just update the status
-    result = supabase.table("draft_responses")\
-        .update({
-            "status": "published",
-            "published_at": datetime.now().isoformat()
-        })\
-        .eq("id", draft_id)\
-        .execute()
-    
+    result = supabase.table("draft_responses").update({
+        "status": "published",
+        "published_at": datetime.now().isoformat()
+    }).eq("id", draft_id).execute()
+
     # Log publication
     supabase.table("approval_workflow_logs").insert({
         "draft_id": draft_id,
         "action": "published",
         "notes": "Draft published to social media"
     }).execute()
-    
+
+    # Update Telegram notification
+    telegram_notifier = get_telegram_notifier()
+    if telegram_notifier:
+        asyncio.create_task(
+            telegram_notifier.update_draft_status(
+                draft_id, "published"
+            )
+        )
+
     return {"status": "published", "draft_id": draft_id}
 
 
 @router.get("/logs/{tenant_id}", response_model=List[Dict])
 async def get_workflow_logs(tenant_id: str):
-    """
-    Get workflow logs for a tenant.
-    """
+    """ Get workflow logs for a tenant. """
     supabase = settings.supabase_client
-    
+
     # Get all drafts for tenant
-    drafts_result = supabase.table("draft_responses")\
-        .select("id")\
-        .eq("tenant_id", tenant_id)\
-        .execute()
-    
+    drafts_result = supabase.table("draft_responses").select("id").eq("tenant_id", tenant_id).execute()
     draft_ids = [d["id"] for d in drafts_result.data]
-    
+
     if not draft_ids:
         return []
-    
+
     # Get logs for these drafts
-    logs_result = supabase.table("approval_workflow_logs")\
-        .select("*")\
-        .in_("draft_id", draft_ids)\
-        .order("created_at", desc=True)\
-        .execute()
-    
+    logs_result = supabase.table("approval_workflow_logs").select("*").in_("draft_id", draft_ids).order("created_at", desc=True).execute()
     return logs_result.data

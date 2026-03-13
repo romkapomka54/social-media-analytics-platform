@@ -1,0 +1,236 @@
+""" Telegram notification service for approval workflow. Sends notifications when new drafts are created and provides inline buttons for approval/rejection. """
+import os
+import logging
+from typing import Optional, Dict, Any
+from datetime import datetime
+import asyncio
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+logger = logging.getLogger(__name__)
+
+
+class DraftApprovalStates(StatesGroup):
+    waiting_for_approval = State()
+    waiting_for_rejection = State()
+
+
+class TelegramNotifier:
+    """Service for sending Telegram notifications about draft responses."""
+
+    def __init__(self, bot_token: str, admin_chat_id: str):
+        """
+        Initialize Telegram notifier.
+
+        Args:
+            bot_token: Telegram Bot API token
+            admin_chat_id: Chat ID where notifications should be sent (can be user ID)
+        """
+        self.bot = Bot(token=bot_token)
+        self.dp = Dispatcher(storage=MemoryStorage())
+        self.admin_chat_id = admin_chat_id
+        self._setup_handlers()
+
+    def _setup_handlers(self):
+        """Setup Telegram bot handlers."""
+        @self.dp.callback_query(lambda c: c.data.startswith("draft_"))
+        async def handle_draft_action(callback: CallbackQuery):
+            """Handle approval/rejection button clicks."""
+            data = callback.data.split("_")
+            action = data[1]
+            draft_id = data[2]
+
+            if action == "approve":
+                await self._handle_approval(callback, draft_id)
+            elif action == "reject":
+                await self._handle_rejection(callback, draft_id)
+
+        @self.dp.message(Command("start"))
+        async def start_command(message: types.Message):
+            """Handle /start command."""
+            await message.answer("🤖 MrKrabs Approval Bot is ready! I will notify you about new drafts.")
+
+    async def _handle_approval(self, callback: CallbackQuery, draft_id: str):
+        """Handle approval action from Telegram."""
+        try:
+            await callback.answer("Draft approved! Publishing...")
+            await callback.message.edit_text(
+                f"✅ Draft {draft_id} has been **APPROVED** and is being published.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Draft {draft_id} approved via Telegram")
+        except Exception as e:
+            logger.error(f"Error handling approval: {e}")
+            await callback.answer("Error processing approval", show_alert=True)
+
+    async def _handle_rejection(self, callback: CallbackQuery, draft_id: str):
+        """Handle rejection action from Telegram."""
+        try:
+            await callback.answer("Draft rejected.")
+            await callback.message.edit_text(
+                f"❌ Draft {draft_id} has been **REJECTED**.",
+                parse_mode="Markdown"
+            )
+            logger.info(f"Draft {draft_id} rejected via Telegram")
+        except Exception as e:
+            logger.error(f"Error handling rejection: {e}")
+            await callback.answer("Error processing rejection", show_alert=True)
+
+    async def send_draft_notification(
+        self,
+        draft_id: str,
+        tenant_id: str,
+        comment_text: str,
+        platform: str,
+        nps_category: str,
+        suggested_reply: str
+    ) -> Optional[int]:
+        """
+        Send notification about a new draft response.
+
+        Args:
+            draft_id: UUID of the draft
+            tenant_id: UUID of the tenant
+            comment_text: Original comment text
+            platform: Social media platform (instagram/youtube/tiktok)
+            nps_category: NPS category (promoter/neutral/detractor)
+            suggested_reply: AI-generated suggested reply
+
+        Returns:
+            Message ID if sent successfully, None otherwise
+        """
+        try:
+            platform_emoji = {
+                "instagram": "📸",
+                "youtube": "🎬",
+                "tiktok": "🎵"
+            }.get(platform.lower(), "📱")
+
+            nps_emoji = {
+                "promoter": "🌟",
+                "neutral": "😐",
+                "detractor": "😠"
+            }.get(nps_category.lower(), "❓")
+
+            message_text = (
+                f"{platform_emoji} **New Draft Response Ready for Approval**\n\n"
+                f"🏢 Tenant ID: `{tenant_id}`\n"
+                f"💬 Comment: *{comment_text[:100]}{'...' if len(comment_text) > 100 else ''}*\n"
+                f"📊 NPS Category: {nps_emoji} *{nps_category.title()}*\n"
+                f"🤖 Suggested Reply:\n"
+                f"_{suggested_reply}_"
+            )
+
+            # Create inline keyboard with approval/rejection buttons
+            builder = InlineKeyboardBuilder()
+            approve_btn = InlineKeyboardButton(
+                text="✅ Approve",
+                callback_data=f"draft_approve_{draft_id}"
+            )
+            reject_btn = InlineKeyboardButton(
+                text="❌ Reject",
+                callback_data=f"draft_reject_{draft_id}"
+            )
+            builder.add(approve_btn, reject_btn)
+            builder.adjust(2)
+
+            keyboard = builder.as_markup()
+
+            result = await self.bot.send_message(
+                chat_id=self.admin_chat_id,
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+
+            logger.info(f"Draft notification sent for {draft_id}")
+            return result.message_id
+
+        except Exception as e:
+            logger.error(f"Error in send_draft_notification: {e}")
+            return None
+
+    async def update_draft_status(
+        self,
+        draft_id: str,
+        status: str,
+        message_id: Optional[int] = None
+    ) -> bool:
+        """
+        Update the status of a draft in Telegram message.
+
+        Args:
+            draft_id: UUID of the draft
+            status: New status (approved/rejected/published)
+            message_id: Telegram message ID to update
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            status_emoji = {
+                "approved": "✅",
+                "rejected": "❌",
+                "published": "🚀"
+            }.get(status, "⏳")
+
+            status_text = {
+                "approved": "APPROVED",
+                "rejected": "REJECTED",
+                "published": "PUBLISHED"
+            }.get(status, status.upper())
+
+            if message_id:
+                await self.bot.edit_message_text(
+                    chat_id=self.admin_chat_id,
+                    message_id=message_id,
+                    text=f"Draft {draft_id} has been {status_text}!",
+                    parse_mode="Markdown"
+                )
+            else:
+                await self.bot.send_message(
+                    chat_id=self.admin_chat_id,
+                    text=f"Draft {draft_id} status updated to: {status_text}"
+                )
+
+            logger.info(f"Draft {draft_id} status updated to {status} in Telegram")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error updating draft status in Telegram: {e}")
+            return False
+
+    async def start_bot(self):
+        """Start the Telegram bot polling."""
+        logger.info("Starting Telegram bot...")
+        await self.dp.start_polling(self.bot)
+
+    async def stop_bot(self):
+        """Stop the Telegram bot."""
+        logger.info("Stopping Telegram bot...")
+        await self.bot.session.close()
+
+
+# Singleton instance
+_notifier_instance: Optional[TelegramNotifier] = None
+
+
+def get_telegram_notifier() -> Optional[TelegramNotifier]:
+    """Get or create singleton Telegram notifier instance."""
+    global _notifier_instance
+    if _notifier_instance is None:
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        admin_chat_id = os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+
+        if bot_token and admin_chat_id:
+            _notifier_instance = TelegramNotifier(bot_token, admin_chat_id)
+            logger.info("Telegram notifier initialized")
+        else:
+            logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_ADMIN_CHAT_ID not set")
+
+    return _notifier_instance
