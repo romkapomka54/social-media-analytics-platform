@@ -5,6 +5,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
+from .routers import youtube
+
+
 from .core.config import settings
 from .routers import health, chat, approval
 
@@ -53,7 +56,7 @@ app.add_middleware(
 app.include_router(health.router, prefix=settings.api_v1_prefix)
 app.include_router(chat.router, prefix=settings.api_v1_prefix)
 app.include_router(approval.router, prefix=settings.api_v1_prefix)
-
+app.include_router(youtube.router, prefix=settings.api_v1_prefix)
 
 @app.get("/")
 async def root():

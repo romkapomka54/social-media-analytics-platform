@@ -46,3 +46,4 @@ logs/
 # Database
 *.db
 *.sqlite
+client_secrets.json
